@@ -695,12 +695,11 @@ func BenchmarkClosureCall(b *testing.B) {
 	_ = sum
 }
 
-func benchmarkWakeupParallel(b *testing.B, spin func(time.Duration)) {
+func benchmarkWakeupParallel(b *testing.B, pairs int, spin func(time.Duration)) {
 	if runtime.GOMAXPROCS(0) == 1 {
 		b.Skip("skipping: GOMAXPROCS=1")
 	}
 
-	wakeDelay := 5 * time.Microsecond
 	for _, delay := range []time.Duration{
 		0,
 		1 * time.Microsecond,
@@ -715,79 +714,94 @@ func benchmarkWakeupParallel(b *testing.B, spin func(time.Duration)) {
 			if b.N == 0 {
 				return
 			}
-			// Start two goroutines, which alternate between being
+			// Start `pairs` pairs of goroutines, which alternate between being
 			// sender and receiver in the following protocol:
 			//
-			// - The receiver spins for `delay` and then does a
-			// blocking receive on a channel.
+			// - The receiver spins for `delay` and then does a blocking
+			// receive on a channel.
 			//
-			// - The sender spins for `delay+wakeDelay` and then
-			// sends to the same channel. (The addition of
-			// `wakeDelay` improves the probability that the
-			// receiver will be blocking when the send occurs when
-			// the goroutines execute in parallel.)
+			// - The sender spins for `delay` and then does a blocking send to
+			// the same channel.
 			//
-			// In each iteration of the benchmark, each goroutine
-			// acts once as sender and once as receiver, so each
-			// goroutine spins for delay twice.
+			// In each iteration of the benchmark, each goroutine acts once as
+			// sender and once as receiver, so each goroutine spins for delay
+			// twice.
 			//
-			// BenchmarkWakeupParallel is used to estimate how
-			// efficiently the scheduler parallelizes goroutines in
-			// the presence of blocking:
+			// benchmarkWakeupParallel is used to estimate how efficiently the
+			// scheduler parallelizes goroutines in the presence of blocking:
 			//
-			// - If both goroutines are executed on the same core,
-			// an increase in delay by N will increase the time per
-			// iteration by 4*N, because all 4 delays are
-			// serialized.
+			// - If both goroutines are executed on the same core, an increase
+			// in delay by N will increase the time per iteration by 4*N,
+			// because all 4 delays are serialized.
 			//
-			// - Otherwise, an increase in delay by N will increase
-			// the time per iteration by 2*N, and the time per
-			// iteration is 2 * (runtime overhead + chan
-			// send/receive pair + delay + wakeDelay). This allows
-			// the runtime overhead, including the time it takes
-			// for the unblocked goroutine to be scheduled, to be
-			// estimated.
-			ping, pong := make(chan struct{}), make(chan struct{})
+			// - Otherwise, an increase in delay by N will increase the time
+			// per iteration by 2*N, and the time per iteration is 2 * (runtime
+			// overhead + chan send/receive pair + delay). This allows the
+			// runtime overhead, including the time it takes for the unblocked
+			// goroutine to be scheduled, to be estimated.
 			start := make(chan struct{})
-			done := make(chan struct{})
-			go func() {
-				<-start
-				for i := 0; i < b.N; i++ {
-					// sender
-					spin(delay + wakeDelay)
-					ping <- struct{}{}
-					// receiver
-					spin(delay)
-					<-pong
-				}
-				done <- struct{}{}
-			}()
-			go func() {
-				for i := 0; i < b.N; i++ {
-					// receiver
-					spin(delay)
-					<-ping
-					// sender
-					spin(delay + wakeDelay)
-					pong <- struct{}{}
-				}
-				done <- struct{}{}
-			}()
+			var allWG sync.WaitGroup
+			for i := 0; i < pairs; i++ {
+				ping, pong := make(chan struct{}), make(chan struct{})
+				allWG.Add(2)
+				go func() {
+					defer allWG.Done()
+					<-start
+					for i := 0; i < b.N; i++ {
+						// sender
+						spin(delay)
+						ping <- struct{}{}
+						// receiver
+						spin(delay)
+						<-pong
+					}
+				}()
+				go func() {
+					defer allWG.Done()
+					for i := 0; i < b.N; i++ {
+						// receiver
+						spin(delay)
+						<-ping
+						// sender
+						spin(delay)
+						pong <- struct{}{}
+					}
+				}()
+			}
 			b.ResetTimer()
-			start <- struct{}{}
-			<-done
-			<-done
+			close(start)
+			allWG.Wait()
 		})
 	}
 }
 
+// There are two BenchmarkWakeupParallelX axes:
+//
+// - Spinning (Ps are usually executing Go code, i.e. in state _Prunning) vs.
+// Syscall (Ps are usually executing syscalls, i.e. in state _Psyscall).
+//
+// - The number of goroutines running: no suffix = 1 pair of communicating
+// goroutines vs. "Full" = GOMAXPROCS communicating goroutines.
+
+func spinDuration(d time.Duration) {
+	end := time.Now().Add(d)
+	for time.Now().Before(end) {
+		// do nothing
+	}
+}
+
 func BenchmarkWakeupParallelSpinning(b *testing.B) {
-	benchmarkWakeupParallel(b, func(d time.Duration) {
-		end := time.Now().Add(d)
-		for time.Now().Before(end) {
-			// do nothing
-		}
-	})
+	if runtime.GOMAXPROCS(0) == 1 {
+		b.Skip("skipping: GOMAXPROCS=1 (equivalent to BenchmarkWakeupParallelSpinningFull)")
+	}
+	benchmarkWakeupParallel(b, 1, spinDuration)
+}
+
+func BenchmarkWakeupParallelSpinningFull(b *testing.B) {
+	if runtime.GOMAXPROCS(0) == 2 {
+		b.Skip("skipping: GOMAXPROCS=2 (equivalent to BenchmarkWakeupParallelSpinning)")
+	}
+	benchmarkWakeupParallel(b, runtime.GOMAXPROCS(0)/2, spinDuration)
 }
 
 // sysNanosleep is defined by OS-specific files (such as runtime_linux_test.go)
@@ -800,9 +814,20 @@ func BenchmarkWakeupParallelSyscall(b *testing.B) {
 	if sysNanosleep == nil {
 		b.Skipf("skipping on %v; sysNanosleep not defined", runtime.GOOS)
 	}
-	benchmarkWakeupParallel(b, func(d time.Duration) {
-		sysNanosleep(d)
-	})
+	if runtime.GOMAXPROCS(0) == 1 {
+		b.Skip("skipping: GOMAXPROCS=1 (equivalent to BenchmarkWakeupParallelSyscallFull)")
+	}
+	benchmarkWakeupParallel(b, 1, sysNanosleep)
+}
+
+func BenchmarkWakeupParallelSyscallFull(b *testing.B) {
+	if sysNanosleep == nil {
+		b.Skipf("skipping on %v; sysNanosleep not defined", runtime.GOOS)
+	}
+	if runtime.GOMAXPROCS(0) == 2 {
+		b.Skip("skipping: GOMAXPROCS=2 (equivalent to BenchmarkWakeupParallelSyscall)")
+	}
+	benchmarkWakeupParallel(b, runtime.GOMAXPROCS(0)/2, sysNanosleep)
 }
 
 type Matrix [][]float64
