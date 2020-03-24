@@ -593,7 +593,8 @@ type p struct {
 	// unit and eliminates the (potentially large) scheduling
 	// latency that otherwise arises from adding the ready'd
 	// goroutines to the end of the run queue.
-	runnext guintptr
+	runnext      guintptr
+	runnextready uint64 // nanotime() when runnext readied
 
 	// Available G's (status == Gdead)
 	gFree struct {

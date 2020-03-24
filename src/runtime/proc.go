@@ -2123,6 +2123,23 @@ func execute(gp *g, inheritTime bool) {
 	gogo(&gp.sched)
 }
 
+const (
+	// stealRunNextDelay is the interval between when a running P's p.runnext
+	// is readied and when it becomes eligible for stealing, in nanoseconds. It
+	// exists to ensure that when one G readies another and then immediately
+	// blocks or exits, its P has time to schedule the second G. A sync chan
+	// send/recv takes 50ns as of this time of writing, so 3us gives us ~60x
+	// overshoot.
+	stealRunNextDelay = 3000
+
+	// stealSpinMax is the minimum amount of time findrunnable() should spend
+	// attempting work-stealing before giving up, in nanoseconds. It should be
+	// fairly long to amortize the overhead of starting and stopping Ms. It
+	// should be greater than stealRunNextDelay to ensure that when a P is
+	// woken to potentially steal a readied G, it has time to actually do so.
+	stealSpinMax = 20000
+)
+
 // Finds a runnable goroutine to execute.
 // Tries to steal from other P's, get g from local or global queue, poll network.
 func findrunnable() (gp *g, inheritTime bool) {
@@ -2189,7 +2206,11 @@ top:
 
 	// Steal work from other P's.
 	procs := uint32(gomaxprocs)
+	var spinend int64
 	ranTimer := false
+	if procs == 1 {
+		goto stop
+	}
 	// If number of spinning M's >= number of busy P's, block.
 	// This is necessary to prevent excessive CPU consumption
 	// when GOMAXPROCS>>1 but the program parallelism is low.
@@ -2200,17 +2221,21 @@ top:
 		_g_.m.spinning = true
 		atomic.Xadd(&sched.nmspinning, 1)
 	}
-	for i := 0; i < 4; i++ {
+	if now == 0 {
+		now = nanotime()
+	}
+	spinend = now + stealSpinMax
+	for {
+		last := now >= spinend
 		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
 			if sched.gcwaiting != 0 {
 				goto top
 			}
-			stealRunNextG := i > 2 // first look for ready queues with more than 1 g
 			p2 := allp[enum.position()]
 			if _p_ == p2 {
 				continue
 			}
-			if gp := runqsteal(_p_, p2, stealRunNextG); gp != nil {
+			if gp := runqsteal(_p_, p2, now); gp != nil {
 				return gp, false
 			}
 
@@ -2221,7 +2246,7 @@ top:
 			// grabbing the lock if p2 is running and not marked
 			// for preemption. If p2 is running and not being
 			// preempted we assume it will handle its own timers.
-			if i > 2 && shouldStealTimers(p2) {
+			if last && shouldStealTimers(p2) {
 				tnow, w, ran := checkTimers(p2, now)
 				now = tnow
 				if w != 0 && (pollUntil == 0 || w < pollUntil) {
@@ -2243,6 +2268,10 @@ top:
 				}
 			}
 		}
+		if last {
+			break
+		}
+		now = nanotime()
 	}
 	if ranTimer {
 		// Running a timer may have made some goroutine ready.
@@ -5040,6 +5069,7 @@ func runqput(_p_ *p, gp *g, next bool) {
 	}
 
 	if next {
+		atomic.Store64(&_p_.runnextready, uint64(nanotime()))
 	retryNext:
 		oldnext := _p_.runnext
 		if !_p_.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
@@ -5173,44 +5203,29 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 // Batch is a ring buffer starting at batchHead.
 // Returns number of grabbed goroutines.
 // Can be executed by any P.
-func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
+func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, now int64) uint32 {
 	for {
 		h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
 		t := atomic.LoadAcq(&_p_.runqtail) // load-acquire, synchronize with the producer
 		n := t - h
 		n = n - n/2
 		if n == 0 {
-			if stealRunNextG {
-				// Try to steal from _p_.runnext.
-				if next := _p_.runnext; next != 0 {
-					if _p_.status == _Prunning {
-						// Sleep to ensure that _p_ isn't about to run the g
-						// we are about to steal.
-						// The important use case here is when the g running
-						// on _p_ ready()s another g and then almost
-						// immediately blocks. Instead of stealing runnext
-						// in this window, back off to give _p_ a chance to
-						// schedule runnext. This will avoid thrashing gs
-						// between different Ps.
-						// A sync chan send/recv takes ~50ns as of time of
-						// writing, so 3us gives ~50x overshoot.
-						if GOOS != "windows" {
-							usleep(3)
-						} else {
-							// On windows system timer granularity is
-							// 1-15ms, which is way too much for this
-							// optimization. So just yield.
-							osyield()
-						}
-					}
-					if !_p_.runnext.cas(next, 0) {
-						continue
-					}
-					batch[batchHead%uint32(len(batch))] = next
-					return 1
+			// Try to steal from _p_.runnext.
+			next := _p_.runnext
+			if next == 0 {
+				return 0
+			}
+			if _p_.status == _Prunning {
+				stealAfter := int64(atomic.Load64(&_p_.runnextready)) + stealRunNextDelay
+				if now < stealAfter {
+					return 0
 				}
 			}
-			return 0
+			if !_p_.runnext.cas(next, 0) {
+				continue
+			}
+			batch[batchHead%uint32(len(batch))] = next
+			return 1
 		}
 		if n > uint32(len(_p_.runq)/2) { // read inconsistent h and t
 			continue
@@ -5228,9 +5243,9 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 // Steal half of elements from local runnable queue of p2
 // and put onto local runnable queue of p.
 // Returns one of the stolen elements (or nil if failed).
-func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
+func runqsteal(_p_, p2 *p, now int64) *g {
 	t := _p_.runqtail
-	n := runqgrab(p2, &_p_.runq, t, stealRunNextG)
+	n := runqgrab(p2, &_p_.runq, t, now)
 	if n == 0 {
 		return nil
 	}
